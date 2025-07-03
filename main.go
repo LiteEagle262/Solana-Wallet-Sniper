@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha512"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -25,16 +27,22 @@ type DiscordPayload struct {
 }
 
 type Embed struct {
-	Title       string  `json:"title"`
-	Description string  `json:"description"`
-	Color       int     `json:"color"`
-	Fields      []Field `json:"fields"`
+	Title       string  `json:"title"`
+	Description string  `json:"description"`
+	Color       int     `json:"color"`
+	Fields      []Field `json:"fields"`
 }
 
 type Field struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Inline bool   `json:"inline"`
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
+type WalletResult struct {
+	mnemonic   string
+	privateKey ed25519.PrivateKey
+	publicKey  ed25519.PublicKey
 }
 
 func unsafeString(b []byte) string {
@@ -47,25 +55,120 @@ func fastPrefixCheck(pubKeyBytes []byte, targetBytes []byte) bool {
 	}
 	
 	encoded := base58.Encode(pubKeyBytes)
-	return len(encoded) >= len(targetBytes) && 
-		   encoded[0] == targetBytes[0] && 
-		   (len(targetBytes) == 1 || encoded[1] == targetBytes[1])
+	return len(encoded) >= len(targetBytes) && 
+		encoded[0] == targetBytes[0] && 
+		(len(targetBytes) == 1 || encoded[1] == targetBytes[1])
 }
 
-func generateOptimizedKey() (ed25519.PrivateKey, ed25519.PublicKey) {
-	seed := make([]byte, 32)
-	rand.Read(seed)
+func fastDeriveSolanaKey(seed []byte) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+	h := sha512.New()
+	h.Write([]byte("ed25519 seed"))
+	h.Write(seed)
+	masterSeed := h.Sum(nil)
 	
-	privateKey := ed25519.NewKeyFromSeed(seed)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	privateKey := masterSeed[:32]
+	chainCode := masterSeed[32:]
 	
-	return privateKey, publicKey
+	derivationPath := []uint32{44 + 0x80000000, 501 + 0x80000000, 0 + 0x80000000, 0 + 0x80000000}
+	
+	for _, childIndex := range derivationPath {
+		data := make([]byte, 37)
+		data[0] = 0x00
+		copy(data[1:33], privateKey)
+		binary.BigEndian.PutUint32(data[33:], childIndex)
+		
+		h := sha512.New()
+		h.Write(chainCode)
+		h.Write(data)
+		hmacResult := h.Sum(nil)
+		
+		privateKey = hmacResult[:32]
+		chainCode = hmacResult[32:]
+	}
+	
+	privKey := ed25519.NewKeyFromSeed(privateKey)
+	pubKey := privKey.Public().(ed25519.PublicKey)
+	
+	return privKey, pubKey, nil
 }
 
-func generateMnemonicFromPrivateKey(privateKey ed25519.PrivateKey) string {
-	seed := privateKey.Seed()
-	mnemonic, _ := bip39.NewMnemonic(seed)
-	return mnemonic
+func generateOptimizedWallet() (WalletResult, error) {
+	entropy := make([]byte, 32)
+	rand.Read(entropy)
+	
+	mnemonic, err := bip39.NewMnemonic(entropy)
+	if err != nil {
+		return WalletResult{}, err
+	}
+	
+	seed := bip39.NewSeed(mnemonic, "")
+	
+	privateKey, publicKey, err := fastDeriveSolanaKey(seed)
+	if err != nil {
+		return WalletResult{}, err
+	}
+	
+	return WalletResult{
+		mnemonic:   mnemonic,
+		privateKey: privateKey,
+		publicKey:  publicKey,
+	}, nil
+}
+
+type EntropyPool struct {
+	pool chan []byte
+	mu   sync.Mutex
+}
+
+func NewEntropyPool(size int) *EntropyPool {
+	pool := make(chan []byte, size)
+	
+	go func() {
+		for {
+			entropy := make([]byte, 32)
+			rand.Read(entropy)
+			select {
+			case pool <- entropy:
+			default:
+				time.Sleep(time.Microsecond)
+			}
+		}
+	}()
+	
+	return &EntropyPool{pool: pool}
+}
+
+func (ep *EntropyPool) GetEntropy() []byte {
+	select {
+	case entropy := <-ep.pool:
+		return entropy
+	default:
+		entropy := make([]byte, 32)
+		rand.Read(entropy)
+		return entropy
+	}
+}
+
+func generateTurboWallet(entropyPool *EntropyPool) (WalletResult, error) {
+	entropy := entropyPool.GetEntropy()
+	
+	mnemonic, err := bip39.NewMnemonic(entropy)
+	if err != nil {
+		return WalletResult{}, err
+	}
+	
+	seed := bip39.NewSeed(mnemonic, "")
+	
+	privateKey, publicKey, err := fastDeriveSolanaKey(seed)
+	if err != nil {
+		return WalletResult{}, err
+	}
+	
+	return WalletResult{
+		mnemonic:   mnemonic,
+		privateKey: privateKey,
+		publicKey:  publicKey,
+	}, nil
 }
 
 func main() {
@@ -97,14 +200,15 @@ func main() {
 	
 	targetBytes := []byte(targetPrefix)
 
+	entropyPool := NewEntropyPool(1000)
+	
 	var wg sync.WaitGroup
-	found := make(chan struct{})
+	found := make(chan WalletResult, 1)
 	startTime := time.Now()
 	var generatedCount uint64 = 0
 
-	numWorkers := runtime.NumCPU() * 2
-	fmt.Printf("🚀 TURBO MODE: Starting %d workers to find public key starting with '%s'...\n", numWorkers, targetPrefix)
-	fmt.Printf("💡 Optimizations: Direct key generation, fast prefix check, minimal allocations\n\n")
+	numWorkers := runtime.NumCPU() * 4
+	fmt.Printf("🚀 Starting %d workers to find public key starting with '%s'...\n", numWorkers, targetPrefix)
 	
 	time.Sleep(1 * time.Second)
 
@@ -113,49 +217,32 @@ func main() {
 		go func() {
 			defer wg.Done()
 			
-			var privateKey ed25519.PrivateKey
-			var publicKey ed25519.PublicKey
-			
 			for {
 				select {
 				case <-found:
 					return
 				default:
-					privateKey, publicKey = generateOptimizedKey()
+					wallet, err := generateTurboWallet(entropyPool)
+					if err != nil {
+						continue
+					}
 					
-					if fastPrefixCheck(publicKey, targetBytes) {
-						solanaPrivateKey := solana.PrivateKey(privateKey)
+					if fastPrefixCheck(wallet.publicKey, targetBytes) {
+						solanaPrivateKey := solana.PrivateKey(wallet.privateKey)
 						solanaPublicKey := solanaPrivateKey.PublicKey()
 						
 						if strings.HasPrefix(solanaPublicKey.String(), targetPrefix) {
 							select {
-							case <-found:
+							case found <- wallet:
 								return
 							default:
-								close(found)
-								elapsedTime := time.Since(startTime)
-								
-								mnemonic := generateMnemonicFromPrivateKey(privateKey)
-
-								fmt.Printf("\n\n🎉 JACKPOT! Wallet found in %s!\n", elapsedTime.Round(time.Millisecond))
-								fmt.Println("========================================")
-								fmt.Printf("🔑 Public Key: %s\n", solanaPublicKey)
-								fmt.Printf("🔐 Private Key: %s\n", solanaPrivateKey)
-								fmt.Printf("📝 Mnemonic: %s\n", mnemonic)
-								fmt.Printf("⚡ Keys checked: %d\n", atomic.LoadUint64(&generatedCount))
-								fmt.Printf("🏃 Average rate: %.0f keys/sec\n", float64(atomic.LoadUint64(&generatedCount))/elapsedTime.Seconds())
-								fmt.Println("========================================")
-
-								if webhookURL != "" {
-									fmt.Println("📤 Sending to Discord...")
-									sendToDiscord(webhookURL, solanaPublicKey.String(), mnemonic, elapsedTime)
-								}
+								return
 							}
-							return
 						}
 					}
 					
-					if atomic.AddUint64(&generatedCount, 1) % 1000 == 0 {
+					count := atomic.AddUint64(&generatedCount, 1)
+					if count % 500 == 0 {
 						runtime.Gosched()
 					}
 				}
@@ -164,7 +251,7 @@ func main() {
 	}
 
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		lastCount := uint64(0)
 		lastTime := time.Now()
@@ -183,11 +270,31 @@ func main() {
 				lastCount = currentCount
 				lastTime = now
 				
-				fmt.Printf("\r🔍 Searching... | 🚀 Rate: %.0f keys/sec | 📈 Total: %d | ⏱️  %v        ", 
+				fmt.Printf("\r🔍 Searching... | 🚀 Rate: %.0f keys/sec | 📈 Total: %d | ⏱️  %v        ", 
 					rate, currentCount, time.Since(startTime).Round(time.Second))
 			}
 		}
 	}()
+
+	wallet := <-found
+	elapsedTime := time.Since(startTime)
+	
+	solanaPrivateKey := solana.PrivateKey(wallet.privateKey)
+	solanaPublicKey := solanaPrivateKey.PublicKey()
+
+	fmt.Printf("\n\n🎉 JACKPOT! Wallet found in %s!\n", elapsedTime.Round(time.Millisecond))
+	fmt.Println("========================================")
+	fmt.Printf("🔑 Public Key: %s\n", solanaPublicKey)
+	fmt.Printf("🔐 Private Key: %s\n", solanaPrivateKey)
+	fmt.Printf("📝 Mnemonic: %s\n", wallet.mnemonic)
+	fmt.Printf("⚡ Keys checked: %d\n", atomic.LoadUint64(&generatedCount))
+	fmt.Printf("🏃 Average rate: %.0f keys/sec\n", float64(atomic.LoadUint64(&generatedCount))/elapsedTime.Seconds())
+	fmt.Println("========================================")
+
+	if webhookURL != "" {
+		fmt.Println("📤 Sending to Discord...")
+		sendToDiscord(webhookURL, solanaPublicKey.String(), wallet.mnemonic, elapsedTime)
+	}
 
 	wg.Wait()
 }
@@ -196,28 +303,28 @@ func sendToDiscord(webhookURL, publicKey, mnemonic string, duration time.Duratio
 	payload := DiscordPayload{
 		Embeds: []Embed{
 			{
-				Title:       "🎉 Solana Vanity Address Found!",
+				Title:       "🎉 Solana Vanity Address Found!",
 				Description: "A new wallet matching the criteria has been generated.",
-				Color:       3066993,
+				Color:       3066993,
 				Fields: []Field{
 					{
-						Name:   "Public Key",
-						Value:  fmt.Sprintf("`%s`", publicKey),
+						Name:   "Public Key",
+						Value:  fmt.Sprintf("`%s`", publicKey),
 						Inline: false,
 					},
 					{
-						Name:   "Mnemonic Phrase (Private)",
-						Value:  fmt.Sprintf("||`%s`||", mnemonic),
+						Name:   "Mnemonic Phrase (Private)",
+						Value:  fmt.Sprintf("||`%s`||", mnemonic),
 						Inline: false,
 					},
 					{
-						Name:   "Time to Find",
-						Value:  duration.Round(time.Second).String(),
+						Name:   "Time to Find",
+						Value:  duration.Round(time.Second).String(),
 						Inline: true,
 					},
 					{
-						Name:   "Timestamp",
-						Value:  time.Now().Format(time.RFC1123),
+						Name:   "Timestamp",
+						Value:  time.Now().Format(time.RFC1123),
 						Inline: true,
 					},
 				},
