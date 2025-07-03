@@ -17,7 +17,7 @@ The time it takes to find an address with a specific prefix depends on how many 
 * **7 Characters:** $(1/58)^7 \approx 1 \text{ in } 2,207,984,167,552$
   * **Estimated Time:** $\approx 53.2 \text{ days}$
 
-This project was originally made with `go1.20.1`. It's highly recommended to use the latest stable Go release or a pre-built binary for the best performance and security.
+This project was originally made with `go1.20.1`. It's highly recommended to use the [Pre-built executable](https://github.com/LiteEagle262/Solana-Wallet-Sniper/releases/tag/v1) if your version does not work with the program.
 
 ### How to Use
 
