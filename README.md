@@ -2,6 +2,8 @@
 
 This is a fun project written in Go that helps you find Solana vanity addresses! It's designed to be super fast; when running on a good server, it can check around 480,000 keys per second!
 
+**THIS PROGRAM IS CPU BASED:** if you are looking at getting more speed but a harder setup find another repo that supports gpu mining for wallet generation.
+
 The time it takes to find an address with a specific prefix depends on how many characters are in that prefix. The probabilities and estimated times (based on 480,000 keys/second) are:
 
 * **2 Characters:** $(1/58)^2 \approx 1 \text{ in } 3,364$
