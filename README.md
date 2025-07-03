@@ -38,3 +38,9 @@ go run main.go eagle https://discord.com/api/webhooks/your-webhook-url
 
 The **Discord Webhook** argument is **optional**. If you don't provide it, the results will still be printed to your console.
 
+Example Finds: 
+
+![image](https://github.com/user-attachments/assets/e98f9f79-1f2f-45a0-94d3-6cb7b9949d17)
+
+![image](https://github.com/user-attachments/assets/dee7160c-0621-4c8f-9845-bfe84954bd6b)
+
