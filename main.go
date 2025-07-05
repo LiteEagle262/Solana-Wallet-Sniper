@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
@@ -15,7 +16,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/tyler-smith/go-bip39"
@@ -45,10 +45,6 @@ type WalletResult struct {
 	publicKey  ed25519.PublicKey
 }
 
-func unsafeString(b []byte) string {
-	return *(*string)(unsafe.Pointer(&b))
-}
-
 func fastPrefixCheck(pubKeyBytes []byte, targetBytes []byte) bool {
 	if len(targetBytes) == 0 {
 		return true
@@ -60,50 +56,67 @@ func fastPrefixCheck(pubKeyBytes []byte, targetBytes []byte) bool {
 		(len(targetBytes) == 1 || encoded[1] == targetBytes[1])
 }
 
-func fastDeriveSolanaKey(seed []byte) (ed25519.PrivateKey, ed25519.PublicKey, error) {
-	h := sha512.New()
-	h.Write([]byte("ed25519 seed"))
-	h.Write(seed)
-	masterSeed := h.Sum(nil)
+// Proper BIP32 HMAC-SHA512 based key derivation
+func deriveKey(parentKey, parentChainCode []byte, index uint32) ([]byte, []byte) {
+	data := make([]byte, 37)
+	data[0] = 0x00 // Private key derivation
+	copy(data[1:33], parentKey)
+	binary.BigEndian.PutUint32(data[33:], index)
 	
-	privateKey := masterSeed[:32]
-	chainCode := masterSeed[32:]
+	mac := hmac.New(sha512.New, parentChainCode)
+	mac.Write(data)
+	hash := mac.Sum(nil)
 	
-	derivationPath := []uint32{44 + 0x80000000, 501 + 0x80000000, 0 + 0x80000000, 0 + 0x80000000}
+	return hash[:32], hash[32:]
+}
+
+// Proper BIP44 derivation for Solana: m/44'/501'/0'/0'
+func deriveSolanaKeyFromSeed(seed []byte) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+	// Generate master key from seed
+	mac := hmac.New(sha512.New, []byte("ed25519 seed"))
+	mac.Write(seed)
+	masterHash := mac.Sum(nil)
 	
-	for _, childIndex := range derivationPath {
-		data := make([]byte, 37)
-		data[0] = 0x00
-		copy(data[1:33], privateKey)
-		binary.BigEndian.PutUint32(data[33:], childIndex)
-		
-		h := sha512.New()
-		h.Write(chainCode)
-		h.Write(data)
-		hmacResult := h.Sum(nil)
-		
-		privateKey = hmacResult[:32]
-		chainCode = hmacResult[32:]
+	masterKey := masterHash[:32]
+	masterChainCode := masterHash[32:]
+	
+	// BIP44 path: m/44'/501'/0'/0'
+	derivationPath := []uint32{
+		44 + 0x80000000,  // Purpose (hardened)
+		501 + 0x80000000, // Coin type - Solana (hardened)  
+		0 + 0x80000000,   // Account (hardened)
+		0 + 0x80000000,   // Change (hardened)
 	}
 	
-	privKey := ed25519.NewKeyFromSeed(privateKey)
-	pubKey := privKey.Public().(ed25519.PublicKey)
+	currentKey := masterKey
+	currentChainCode := masterChainCode
 	
-	return privKey, pubKey, nil
+	for _, index := range derivationPath {
+		currentKey, currentChainCode = deriveKey(currentKey, currentChainCode, index)
+	}
+	
+	// Create Ed25519 key pair
+	privateKey := ed25519.NewKeyFromSeed(currentKey)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	
+	return privateKey, publicKey, nil
 }
 
 func generateOptimizedWallet() (WalletResult, error) {
 	entropy := make([]byte, 32)
-	rand.Read(entropy)
+	if _, err := rand.Read(entropy); err != nil {
+		return WalletResult{}, err
+	}
 	
 	mnemonic, err := bip39.NewMnemonic(entropy)
 	if err != nil {
 		return WalletResult{}, err
 	}
 	
+	// Generate seed from mnemonic (with empty passphrase)
 	seed := bip39.NewSeed(mnemonic, "")
 	
-	privateKey, publicKey, err := fastDeriveSolanaKey(seed)
+	privateKey, publicKey, err := deriveSolanaKeyFromSeed(seed)
 	if err != nil {
 		return WalletResult{}, err
 	}
@@ -126,7 +139,10 @@ func NewEntropyPool(size int) *EntropyPool {
 	go func() {
 		for {
 			entropy := make([]byte, 32)
-			rand.Read(entropy)
+			if _, err := rand.Read(entropy); err != nil {
+				time.Sleep(time.Millisecond)
+				continue
+			}
 			select {
 			case pool <- entropy:
 			default:
@@ -159,7 +175,7 @@ func generateTurboWallet(entropyPool *EntropyPool) (WalletResult, error) {
 	
 	seed := bip39.NewSeed(mnemonic, "")
 	
-	privateKey, publicKey, err := fastDeriveSolanaKey(seed)
+	privateKey, publicKey, err := deriveSolanaKeyFromSeed(seed)
 	if err != nil {
 		return WalletResult{}, err
 	}
@@ -242,7 +258,7 @@ func main() {
 					}
 					
 					count := atomic.AddUint64(&generatedCount, 1)
-					if count % 500 == 0 {
+					if count%500 == 0 {
 						runtime.Gosched()
 					}
 				}
